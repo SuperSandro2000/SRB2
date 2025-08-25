@@ -334,8 +334,6 @@ static void InitialiseImages(moviedecodeworker_t *worker)
 
 static void InitialiseVideoBuffer(movie_t *movie)
 {
-	movie->videostream.numplanes = 1;
-
 	AVRational *fps = &movie->videostream.stream->avg_frame_rate;
 	InitialiseBuffer(
 		&movie->videostream.buffer,
@@ -350,8 +348,6 @@ static void InitialiseAudioBuffer(moviestream_t *stream, moviedecodeworker_t *wo
 
 	if (!stream->stream)
 		return;
-
-	stream->numplanes = av_sample_fmt_is_planar(AV_SAMPLE_FMT_S16) ? workerstream->codeccontext->channels : 1;
 
 	INT64 samplesperframe = GetSamplesPerFrame(worker->frame->nb_samples, workerstream->codeccontext->sample_rate);
 

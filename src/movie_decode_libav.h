@@ -102,7 +102,6 @@ struct moviestream_s
 	AVStream *stream;
 	int index;
 	moviebuffer_t buffer;
-	INT32 numplanes;
 };
 
 typedef struct movie

@@ -54,7 +54,7 @@ static void InitialiseBuffer(moviebuffer_t *buffer, INT32 capacity, INT32 slotsi
 
 	buffer->data = calloc(capacity, slotsize);
 	if (!buffer->data)
-		I_Error("FFmpeg: cannot allocate buffer");
+		I_Error("libav: cannot allocate buffer");
 }
 
 static void UninitialiseBuffer(moviebuffer_t *buffer)
@@ -68,7 +68,7 @@ static void CloneBuffer(moviebuffer_t *dst, moviebuffer_t *src)
 
 	dst->data = calloc(dst->capacity, dst->slotsize);
 	if (!dst->data)
-		I_Error("FFmpeg: cannot allocate buffer");
+		I_Error("libav: cannot allocate buffer");
 
 	memcpy(dst->data, src->data, dst->capacity * dst->slotsize);
 }
@@ -276,7 +276,7 @@ static void AllocateAVImage(moviedecodeworker_t *worker, avimage_t *image, enum 
 		pixelformat, alignment
 	);
 	if (image->datasize < 0)
-		I_Error("FFmpeg: cannot allocate image");
+		I_Error("libav: cannot allocate image");
 }
 
 static AVCodecContext *InitialiseDecoding(AVStream *stream)
@@ -289,17 +289,17 @@ static AVCodecContext *InitialiseDecoding(AVStream *stream)
 
 	codec = avcodec_find_decoder(stream->codecpar->codec_id);
 	if (!codec)
-		I_Error("FFmpeg: cannot find codec");
+		I_Error("libav: cannot find codec");
 
 	codeccontext = avcodec_alloc_context3(codec);
 	if (!codeccontext)
-		I_Error("FFmpeg: cannot allocate codec context");
+		I_Error("libav: cannot allocate codec context");
 
 	if (avcodec_parameters_to_context(codeccontext, stream->codecpar) < 0)
-		I_Error("FFmpeg: cannot copy parameters to codec context");
+		I_Error("libav: cannot copy parameters to codec context");
 
 	if (avcodec_open2(codeccontext, codec, NULL) < 0)
-		I_Error("FFmpeg: cannot open codec");
+		I_Error("libav: cannot open codec");
 
 	return codeccontext;
 }
@@ -315,7 +315,7 @@ static void InitialiseImages(moviedecodeworker_t *worker)
 			INT32 size = worker->videostream.codeccontext->width * (sizeof(UINT32) + GetBytesPerPatchColumn(worker));
 			frame->image.patch = malloc(size);
 			if (!frame->image.patch)
-				I_Error("FFmpeg: cannot allocate patch data");
+				I_Error("libav: cannot allocate patch data");
 		}
 		else
 		{
@@ -368,7 +368,7 @@ static void InitialiseAudioBuffer(moviestream_t *stream, moviedecodeworker_t *wo
 			worker->frame->channels, samplesperframe,
 			AV_SAMPLE_FMT_S16, 1
 		))
-			I_Error("FFmpeg: cannot allocate samples");
+			I_Error("libav: cannot allocate samples");
 	}
 }
 
@@ -380,7 +380,7 @@ static void InitialisePacketQueue(moviedecodeworker_t *worker)
 	{
 		AVPacket *packet = av_packet_alloc();
 		if (!packet)
-			I_Error("FFmpeg: cannot allocate packet");
+			I_Error("libav: cannot allocate packet");
 
 		AVPacket **packetslot = EnqueueBuffer(&worker->packetpool);
 		*packetslot = packet;
@@ -391,7 +391,7 @@ static void InitialiseVideoConversion(moviedecodeworker_t *worker)
 {
 	worker->frame = av_frame_alloc();
 	if (!worker->frame)
-		I_Error("FFmpeg: cannot allocate frame");
+		I_Error("libav: cannot allocate frame");
 
 	int width = worker->videostream.codeccontext->width;
 	int height = worker->videostream.codeccontext->height;
@@ -405,7 +405,7 @@ static void InitialiseVideoConversion(moviedecodeworker_t *worker)
 		NULL
 	);
 	if (!worker->yuv444scalingcontext)
-		I_Error("FFmpeg: cannot create YUV444 scaling context");
+		I_Error("libav: cannot create YUV444 scaling context");
 
 	worker->rgbascalingcontext = sws_getContext(
 		width, height, worker->usedithering ? AV_PIX_FMT_YUV444P : worker->videostream.codeccontext->pix_fmt,
@@ -416,7 +416,7 @@ static void InitialiseVideoConversion(moviedecodeworker_t *worker)
 		NULL
 	);
 	if (!worker->rgbascalingcontext)
-		I_Error("FFmpeg: cannot create RGBA scaling context");
+		I_Error("libav: cannot create RGBA scaling context");
 
 	InitColorLUT(&worker->colorlut, pMasterPalette, true);
 }
@@ -431,9 +431,9 @@ static void InitialiseAudioConversion(moviedecodeworker_t *worker)
 		0, NULL
 	);
 	if (!worker->resamplingcontext)
-		I_Error("FFmpeg: cannot allocate resampling context");
+		I_Error("libav: cannot allocate resampling context");
 	if (swr_init(worker->resamplingcontext))
-		I_Error("FFmpeg: cannot initialise resampling context");
+		I_Error("libav: cannot initialise resampling context");
 }
 
 static void InitialiseDecodeWorker(movie_t *movie)
@@ -572,10 +572,10 @@ static void SendPacket(moviedecodeworker_t *worker)
 	else if (packet->stream_index == worker->audiostream.index)
 		context = worker->audiostream.codeccontext;
 	else
-		I_Error("FFmpeg: unexpected packet");
+		I_Error("libav: unexpected packet");
 
 	if (avcodec_send_packet(context, packet) < 0)
-		I_Error("FFmpeg: cannot send packet to the decoder");
+		I_Error("libav: cannot send packet to the decoder");
 
 	av_packet_unref(packet);
 }
@@ -591,7 +591,7 @@ static boolean ReceiveFrame(moviedecodeworker_t *worker, moviedecodeworkerstream
 	else if (error == AVERROR(EAGAIN)) // More packets needed
 		return false;
 	else // Error
-		I_Error("FFmpeg: cannot receive frame");
+		I_Error("libav: cannot receive frame");
 }
 
 static SINT8 dithermatrix[8][8] = {
@@ -756,7 +756,7 @@ static void ParseAudioFrame(moviedecodeworker_t *worker)
 		worker->frame->nb_samples
 	);
 	if (numoutputsamples < 0)
-		I_Error("FFmpeg: cannot convert audio frame");
+		I_Error("libav: cannot convert audio frame");
 
 	frame->pts = worker->frame->pts;
 	frame->numsamples = numoutputsamples;
@@ -777,7 +777,7 @@ static void FlushStream(moviedecodeworker_t *worker, moviedecodeworkerstream_t *
 {
 	// Flush the decoder
 	if (avcodec_send_packet(stream->codeccontext, NULL) < 0)
-		I_Error("FFmpeg: cannot flush decoder");
+		I_Error("libav: cannot flush decoder");
 
 	while (true)
 	{
@@ -787,7 +787,7 @@ static void FlushStream(moviedecodeworker_t *worker, moviedecodeworkerstream_t *
 		else if (error == AVERROR_EOF)
 			break;
 		else
-			I_Error("FFmpeg: cannot receive frame");
+			I_Error("libav: cannot receive frame");
 	}
 
 	avcodec_flush_buffers(stream->codeccontext);
@@ -937,12 +937,12 @@ static void CacheMovieLump(movie_t *movie, const char *name)
 
 	lumpnum = FindMovieLumpNum(name);
 	if (lumpnum == LUMPERROR)
-		I_Error("FFmpeg: cannot find movie lump");
+		I_Error("libav: cannot find movie lump");
 
 	movie->lumpsize = W_LumpLength(lumpnum);
 	movie->lumpdata = malloc(movie->lumpsize);
 	if (!movie->lumpdata)
-		I_Error("FFmpeg: cannot allocate lump data");
+		I_Error("libav: cannot allocate lump data");
 	W_ReadLump(lumpnum, movie->lumpdata);
 }
 
@@ -976,26 +976,26 @@ static void InitialiseDemuxing(movie_t *movie)
 {
 	movie->formatcontext = avformat_alloc_context();
 	if (!movie->formatcontext)
-		I_Error("FFmpeg: cannot allocate format context");
+		I_Error("libav: cannot allocate format context");
 
 	UINT8 *streambuffer = av_malloc(IO_BUFFER_SIZE);
 	if (!streambuffer)
-		I_Error("FFmpeg: cannot allocate stream buffer");
+		I_Error("libav: cannot allocate stream buffer");
 	movie->lumpposition = 0;
 
 	movie->formatcontext->pb = avio_alloc_context(streambuffer, IO_BUFFER_SIZE, 0, movie, ReadStream, NULL, SeekStream);
 	if (!movie->formatcontext->pb)
-		I_Error("FFmpeg: cannot allocate I/O context");
+		I_Error("libav: cannot allocate I/O context");
 
 	if (avformat_open_input(&movie->formatcontext, NULL, NULL, NULL) != 0)
-		I_Error("FFmpeg: cannot open format context");
+		I_Error("libav: cannot open format context");
 
 	if (avformat_find_stream_info(movie->formatcontext, NULL) < 0)
-		I_Error("FFmpeg: cannot find stream information");
+		I_Error("libav: cannot find stream information");
 
 	movie->videostream.index = av_find_best_stream(movie->formatcontext, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
 	if (movie->videostream.index < 0)
-		I_Error("FFmpeg: cannot find video stream");
+		I_Error("libav: cannot find video stream");
 	movie->videostream.stream = movie->formatcontext->streams[movie->videostream.index];
 
 	movie->audiostream.index = av_find_best_stream(movie->formatcontext, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
@@ -1027,7 +1027,7 @@ static boolean ReadPacket(movie_t *movie)
 	if (error == AVERROR_EOF)
 		return false;
 	else if (error < 0)
-		I_Error("FFmpeg: cannot read packet");
+		I_Error("libav: cannot read packet");
 	else if (packet->stream_index == movie->videostream.index
 		|| packet->stream_index == movie->audiostream.index)
 	{
@@ -1091,7 +1091,7 @@ static void Seek(movie_t *movie)
 		MSToVideoPTS(movie, movie->position),
 		0
 	) < 0)
-		I_Error("FFmpeg: cannot seek");
+		I_Error("libav: cannot seek");
 
 	FlushDecodeWorker(&movie->decodeworker);
 }
@@ -1132,7 +1132,7 @@ movie_t *MovieDecode_Play(const char *name, boolean usepatches, boolean usedithe
 
 	movie = calloc(1, sizeof(*movie));
 	if (!movie)
-		I_Error("FFmpeg: cannot allocate movie object");
+		I_Error("libav: cannot allocate movie object");
 
 	movie->lastvideoframeusedid = 0;
 	movie->position = 0;

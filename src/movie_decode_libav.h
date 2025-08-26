@@ -55,6 +55,7 @@ typedef struct
 	INT32 slotsize;
 	INT32 start;
 	INT32 size;
+	boolean dynamic;
 } moviebuffer_t;
 
 typedef struct moviestream_s moviestream_t;
@@ -65,7 +66,6 @@ typedef struct
 	AVCodecContext *codeccontext;
 	moviebuffer_t framepool;
 	moviebuffer_t framequeue;
-	moviestream_t *stream; // Hack
 } moviedecodeworkerstream_t;
 
 typedef struct

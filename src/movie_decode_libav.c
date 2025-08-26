@@ -51,10 +51,17 @@ static void InitialiseBuffer(moviebuffer_t *buffer, INT32 capacity, INT32 slotsi
 	buffer->slotsize = slotsize;
 	buffer->start = 0;
 	buffer->size = 0;
+	buffer->dynamic = false;
 
 	buffer->data = calloc(capacity, slotsize);
 	if (!buffer->data)
 		I_Error("libav: cannot allocate buffer");
+}
+
+static void InitialiseDynamicBuffer(moviebuffer_t *buffer, INT32 capacity, INT32 slotsize)
+{
+	InitialiseBuffer(buffer, capacity, slotsize);
+	buffer->dynamic = true;
 }
 
 static void UninitialiseBuffer(moviebuffer_t *buffer)
@@ -89,28 +96,91 @@ static void *PeekBuffer(const moviebuffer_t *buffer)
 	return GetBufferSlot(buffer, 0);
 }
 
+static void GrowBuffer(moviebuffer_t *buffer)
+{
+	INT32 oldcapacity = buffer->capacity;
+	INT32 oldstart = buffer->start;
+	INT32 slotsize = buffer->slotsize;
+
+	buffer->capacity *= 2;
+
+	buffer->data = realloc(buffer->data, buffer->capacity * slotsize);
+	if (!buffer->data)
+		I_Error("libav: cannot grow buffer");
+
+	if (oldstart + buffer->size > oldcapacity)
+	{
+		buffer->start += buffer->capacity - oldcapacity;
+
+		void *src = (UINT8*)buffer->data + oldstart * slotsize;
+		void *dst = (UINT8*)buffer->data + buffer->start * slotsize;
+		size_t size = (oldcapacity - oldstart) * slotsize;
+
+		memmove(dst, src, size);
+	}
+}
+
 static void *EnqueueBuffer(moviebuffer_t *buffer)
 {
 	if (buffer->size == buffer->capacity)
-		I_Error("libav: buffer is full");
+	{
+		if (buffer->dynamic)
+			GrowBuffer(buffer);
+		else
+			I_Error("libav: buffer is full");
+	}
 
 	buffer->size++;
 	return GetBufferSlot(buffer, buffer->size - 1);
 }
 
-static void *DequeueBuffer(moviebuffer_t *buffer)
+static void ShrinkBuffer(moviebuffer_t *buffer)
 {
-	void *slot = PeekBuffer(buffer);
+	INT32 oldcapacity = buffer->capacity;
+	INT32 oldstart = buffer->start;
+	INT32 slotsize = buffer->slotsize;
+
+	if (buffer->capacity <= 1)
+		return;
+
+	buffer->capacity /= 2;
+
+	if (oldstart + buffer->size > buffer->capacity)
+	{
+		INT32 offset = oldcapacity - buffer->capacity;
+
+		if (buffer->start >= buffer->capacity)
+			buffer->start -= offset;
+
+		INT32 srcindex = max(oldstart, buffer->capacity);
+		void *src = (UINT8*)buffer->data + srcindex * slotsize;
+		void *dst = (UINT8*)src - offset * slotsize;
+		size_t size = (min(oldstart + buffer->size, oldcapacity) - srcindex) * slotsize;
+
+		memmove(dst, src, size);
+	}
+
+	buffer->data = realloc(buffer->data, buffer->capacity * slotsize);
+	if (!buffer->data)
+		I_Error("libav: cannot shrink buffer");
+}
+
+static void DequeueBuffer(moviebuffer_t *buffer, void *dstslot)
+{
+	if (dstslot)
+		memcpy(dstslot, PeekBuffer(buffer), buffer->slotsize);
+
 	buffer->start = (buffer->start + 1) % buffer->capacity;
 	buffer->size--;
-	return slot;
+
+	if (buffer->dynamic && buffer->size <= buffer->capacity / 4)
+		ShrinkBuffer(buffer);
 }
 
 static void *DequeueBufferIntoBuffer(moviebuffer_t *dst, moviebuffer_t *src)
 {
-	void *srcslot = DequeueBuffer(src);
 	void *dstslot = EnqueueBuffer(dst);
-	memcpy(dstslot, srcslot, src->slotsize);
+	DequeueBuffer(src, dstslot);
 	return dstslot;
 }
 
@@ -342,35 +412,10 @@ static void InitialiseVideoBuffer(movie_t *movie)
 	);
 }
 
-static void InitialiseAudioBuffer(moviestream_t *stream, moviedecodeworker_t *worker)
+static void InitialiseAudioBuffer(movie_t *movie)
 {
-	moviedecodeworkerstream_t *workerstream = &worker->audiostream;
-
-	if (!stream->stream)
-		return;
-
-	INT64 samplesperframe = GetSamplesPerFrame(worker->frame->nb_samples, workerstream->codeccontext->sample_rate);
-
-	InitialiseBuffer(
-		&stream->buffer,
-		STREAM_BUFFER_TIME / 1000 * workerstream->codeccontext->sample_rate / samplesperframe,
-		sizeof(movieaudioframe_t)
-	);
-
-	CloneBuffer(&workerstream->framequeue, &stream->buffer);
-	CloneBuffer(&workerstream->framepool, &stream->buffer);
-
-	for (INT32 i = 0; i < workerstream->framepool.capacity; i++)
-	{
-		movieaudioframe_t *frame = EnqueueBuffer(&workerstream->framepool);
-
-		if (!av_samples_alloc(
-			frame->samples, NULL,
-			worker->frame->channels, samplesperframe,
-			AV_SAMPLE_FMT_S16, 1
-		))
-			I_Error("libav: cannot allocate samples");
-	}
+	if (movie->audiostream.stream)
+		InitialiseDynamicBuffer(&movie->audiostream.buffer, 1, sizeof(movieaudioframe_t));
 }
 
 static void InitialisePacketQueue(moviedecodeworker_t *worker)
@@ -450,75 +495,85 @@ static void InitialiseDecodeWorker(movie_t *movie)
 	worker->audiostream.codeccontext = InitialiseDecoding(movie->audiostream.stream);
 	CloneBuffer(&worker->videostream.framequeue, &vstream->buffer);
 	CloneBuffer(&worker->videostream.framepool, &vstream->buffer);
+	CloneBuffer(&worker->audiostream.framequeue, &movie->audiostream.buffer);
 	InitialiseImages(worker);
 	InitialisePacketQueue(worker);
 	InitialiseVideoConversion(worker);
 	InitialiseAudioConversion(worker);
-
-	// Hack because we don't know the audio frame size in advance
-	// so we initialise the audio buffer in the worker thread
-	worker->videostream.stream = vstream;
-	worker->audiostream.stream = &movie->audiostream;
 }
 
 //
 // DECODING WORKER DEINITIALISATION
 //
 
-static void FlushFrameBuffers(moviestream_t *stream, moviedecodeworkerstream_t *workerstream)
+static void FlushVideoFrameBuffers(movie_t *movie)
 {
 	DequeueWholeBufferIntoBuffer(&workerstream->framepool, &stream->buffer);
 	DequeueWholeBufferIntoBuffer(&workerstream->framepool, &workerstream->framequeue);
+}
+
+static void FlushAudioFrameQueue(moviebuffer_t *queue)
+{
+	while (queue->size > 0)
+	{
+		movieaudioframe_t *frame = PeekBuffer(queue);
+		av_freep(&frame->samples[0]);
+		DequeueBuffer(queue, NULL);
+	}
+}
+
+static void FlushAudioFrameBuffers(movie_t *movie)
+{
+	FlushAudioFrameQueue(&movie->audiostream.buffer);
+	FlushAudioFrameQueue(&movie->decodeworker.audiostream.framequeue);
 }
 
 static void UninitialiseImages(movie_t *movie)
 {
 	moviedecodeworker_t *worker = &movie->decodeworker;
 
-	FlushFrameBuffers(&movie->videostream, &worker->videostream);
+	FlushVideoFrameBuffers(movie);
 
 	while (worker->videostream.framepool.size > 0)
 	{
-		movievideoframe_t *frame = DequeueBuffer(&worker->videostream.framepool);
+		movievideoframe_t *frame = PeekBuffer(&worker->videostream.framepool);
 
 		if (movie->usepatches)
 			free(frame->image.patch);
 		else
 			av_freep(&frame->image.rgba.data[0]);
+
+		DequeueBuffer(&worker->videostream.framepool, NULL);
 	}
 
 	av_freep(&worker->yuv444image.data[0]);
 	av_freep(&worker->rgbaimage.data[0]);
 }
 
-static void UninitialiseDecodeWorkerStream(movie_t *movie, moviestream_t *stream, moviedecodeworkerstream_t *workerstream)
+static void UninitialiseDecodeWorkerVideoStream(movie_t *movie)
 {
-	FlushFrameBuffers(stream, workerstream);
+	FlushVideoFrameBuffers(movie);
+	UninitialiseImages(movie);
+	UninitialiseBuffer(&movie->decodeworker.videostream.framepool);
+	UninitialiseBuffer(&movie->decodeworker.videostream.framequeue);
+	avcodec_free_context(&movie->decodeworker.videostream.codeccontext);
+}
 
-	if (stream == &movie->videostream)
-	{
-		UninitialiseImages(movie);
-	}
-	else if (stream == &movie->audiostream)
-	{
-		while (workerstream->framepool.size > 0)
-		{
-			movieaudioframe_t *frame = DequeueBuffer(&workerstream->framepool);
-			av_freep(&frame->samples[0]);
-		}
-	}
-
-	UninitialiseBuffer(&workerstream->framepool);
-	UninitialiseBuffer(&workerstream->framequeue);
-
-	avcodec_free_context(&workerstream->codeccontext);
+static void UninitialiseDecodeWorkerAudioStream(movie_t *movie)
+{
+	FlushAudioFrameBuffers(movie);
+	UninitialiseBuffer(&movie->decodeworker.audiostream.framequeue);
+	avcodec_free_context(&movie->decodeworker.audiostream.codeccontext);
 }
 
 static void UninitialisePacketQueue(moviedecodeworker_t *worker)
 {
 	DequeueWholeBufferIntoBuffer(&worker->packetpool, &worker->packetqueue);
 	while (worker->packetpool.size > 0)
-		av_packet_free(DequeueBuffer(&worker->packetpool));
+	{
+		av_packet_free(PeekBuffer(&worker->packetpool));
+		DequeueBuffer(&worker->packetpool, NULL);
+	}
 	UninitialiseBuffer(&worker->packetpool);
 	UninitialiseBuffer(&worker->packetqueue);
 }
@@ -527,8 +582,8 @@ static void UninitialiseDecodeWorker(movie_t *movie)
 {
 	moviedecodeworker_t *worker = &movie->decodeworker;
 
-	UninitialiseDecodeWorkerStream(movie, &movie->videostream, &worker->videostream);
-	UninitialiseDecodeWorkerStream(movie, &movie->audiostream, &worker->audiostream);
+	UninitialiseDecodeWorkerVideoStream(movie);
+	UninitialiseDecodeWorkerAudioStream(movie);
 	UninitialisePacketQueue(worker);
 	sws_freeContext(worker->yuv444scalingcontext);
 	sws_freeContext(worker->rgbascalingcontext);
@@ -740,18 +795,20 @@ static void ParseVideoFrame(moviedecodeworker_t *worker)
 
 static void ParseAudioFrame(moviedecodeworker_t *worker)
 {
-	movieaudioframe_t *frame;
-
-	if (!worker->audiostream.framequeue.data)
-		InitialiseAudioBuffer(worker->audiostream.stream, worker);
-
-	frame = PeekBuffer(&worker->audiostream.framepool);
+	movieaudioframe_t frame;
 
 	INT64 maxsamples = GetSamplesPerFrame(worker->frame->nb_samples, worker->audiostream.codeccontext->sample_rate);
 
+	if (!av_samples_alloc(
+		frame.samples, NULL,
+		worker->frame->channels, maxsamples,
+		AV_SAMPLE_FMT_S16, 1
+	))
+		I_Error("libav: cannot allocate samples");
+
 	int numoutputsamples = swr_convert(
 		worker->resamplingcontext,
-		frame->samples,
+		frame.samples,
 		maxsamples,
 		(UINT8 const **)worker->frame->data,
 		worker->frame->nb_samples
@@ -759,11 +816,14 @@ static void ParseAudioFrame(moviedecodeworker_t *worker)
 	if (numoutputsamples < 0)
 		I_Error("libav: cannot convert audio frame");
 
-	frame->pts = worker->frame->pts;
-	frame->numsamples = numoutputsamples;
+	frame.pts = worker->frame->pts;
+	frame.numsamples = numoutputsamples;
 
 	I_lock_mutex(&worker->mutex);
-	DequeueBufferIntoBuffer(&worker->audiostream.framequeue, &worker->audiostream.framepool);
+	{
+		movieaudioframe_t *queueframe = EnqueueBuffer(&worker->audiostream.framequeue);
+		memcpy(queueframe, &frame, sizeof(frame));
+	}
 	I_unlock_mutex(worker->mutex);
 }
 
@@ -794,7 +854,12 @@ static void FlushStream(moviedecodeworker_t *worker, moviedecodeworkerstream_t *
 	avcodec_flush_buffers(stream->codeccontext);
 
 	I_lock_mutex(&worker->mutex);
-	DequeueWholeBufferIntoBuffer(&stream->framepool, &stream->framequeue);
+	{
+		if (stream == &worker->audiostream)
+			FlushAudioFrameQueue(&stream->framequeue);
+		else
+			DequeueWholeBufferIntoBuffer(&stream->framepool, &stream->framequeue);
+	}
 	I_unlock_mutex(worker->mutex);
 }
 
@@ -816,16 +881,13 @@ static void DecoderThread(moviedecodeworker_t *worker)
 	{
 		boolean stopping;
 		INT64 flushing;
-		boolean queuesfull;
+		boolean videoqueuefull;
 
 		I_lock_mutex(&worker->mutex);
 		{
 			stopping = worker->stopping;
 			flushing = worker->flushing;
-
-			INT32 vsize = worker->videostream.framepool.size;
-			INT32 asize = worker->audiostream.framepool.size;
-			queuesfull = (vsize == 0 || (worker->audiostream.framequeue.data && asize == 0));
+			videoqueuefull = (worker->videostream.framepool.size == 0);
 		}
 		I_unlock_mutex(worker->mutex);
 
@@ -833,7 +895,7 @@ static void DecoderThread(moviedecodeworker_t *worker)
 			break;
 		if (flushing)
 			FlushDecoding(worker);
-		if (queuesfull)
+		if (videoqueuefull)
 		{
 			I_hold_cond(&worker->cond, worker->condmutex);
 			continue;
@@ -877,9 +939,18 @@ static void DecoderThread(moviedecodeworker_t *worker)
 // FRAME CLEARING
 //
 
-static void ClearOldestFrame(movie_t *movie, moviestream_t *stream, moviedecodeworkerstream_t *workerstream)
+static void ClearOldestVideoFrame(movie_t *movie)
 {
-	DequeueBufferIntoBuffer(&workerstream->framepool, &stream->buffer);
+	DequeueBufferIntoBuffer(&movie->decodeworker.videostream.framepool, &movie->videostream.buffer);
+	I_wake_one_cond(&movie->decodeworker.cond);
+}
+
+static void ClearOldestAudioFrame(movie_t *movie)
+{
+	movieaudioframe_t *frame = PeekBuffer(&movie->audiostream.buffer);
+	av_freep(&frame->samples[0]);
+	DequeueBuffer(&movie->audiostream.buffer, NULL);
+
 	I_wake_one_cond(&movie->decodeworker.cond);
 }
 
@@ -889,7 +960,7 @@ static void ClearOldVideoFrames(movie_t *movie)
 	INT64 limit = MSToVideoPTS(movie, movie->position - STREAM_BUFFER_TIME / 2);
 
 	while (buffer->size > 0 && ((movievideoframe_t*)PeekBuffer(buffer))->pts < limit)
-		ClearOldestFrame(movie, &movie->videostream, &movie->decodeworker.videostream);
+		ClearOldestVideoFrame(movie);
 }
 
 static void ClearOldAudioFrames(movie_t *movie)
@@ -898,16 +969,16 @@ static void ClearOldAudioFrames(movie_t *movie)
 	INT64 limit = max(MSToAudioPTS(movie, movie->position - STREAM_BUFFER_TIME / 2), 0);
 
 	while (buffer->size > 0 && GetAudioFrameEndPTS(movie, PeekBuffer(buffer)) < limit)
-		ClearOldestFrame(movie, &movie->audiostream, &movie->decodeworker.audiostream);
+		ClearOldestAudioFrame(movie);
 }
 
 static void ClearAllFrames(movie_t *movie)
 {
 	while (movie->videostream.buffer.size != 0)
-		ClearOldestFrame(movie, &movie->videostream, &movie->decodeworker.videostream);
+		ClearOldestVideoFrame(movie);
 
 	while (movie->audiostream.buffer.size != 0)
-		ClearOldestFrame(movie, &movie->audiostream, &movie->decodeworker.audiostream);
+		ClearOldestAudioFrame(movie);
 }
 
 //
@@ -1144,6 +1215,7 @@ movie_t *MovieDecode_Play(const char *name, boolean usepatches, boolean usedithe
 	CacheMovieLump(movie, name);
 	InitialiseDemuxing(movie);
 	InitialiseVideoBuffer(movie);
+	InitialiseAudioBuffer(movie);
 	InitialiseDecodeWorker(movie);
 
 	I_spawn_thread("decode-movie", (I_thread_fn)DecoderThread, &movie->decodeworker);

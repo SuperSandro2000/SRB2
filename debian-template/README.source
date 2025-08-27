@@ -9,7 +9,6 @@ GNU/Linux
 Dependencies:
   SDL 1.2.7 or better (from libsdl.org)
   SDL_Mixer 1.2.2(.7 for file-less music playback) (from libsdl.org)
-  Nasm (use NOASM=1 if you don't have it or have an non-i386 system, I think)
   libPNG 1.2.7
   Zlib 1.2.3
   The Xiph.org libogg and libvorbis libraries
